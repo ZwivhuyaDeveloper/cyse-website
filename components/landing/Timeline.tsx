@@ -13,6 +13,11 @@ import {
   GlobalAdoptionIcon,
 } from "./Icons";
 
+import arrowsModel from "@/public/assets/Arrows.png";
+import bracketsModel from "@/public/assets/Angled_Brackets.png";
+import rocketModel from "@/public/assets/Rocket.png";
+
+import Image, { StaticImageData } from "next/image";
 // ─────────────────────────────────────
 // Types
 // ─────────────────────────────────────
@@ -24,6 +29,8 @@ interface TimelineMilestone {
   description: string;
   status: "completed" | "active" | "upcoming";
   icon: React.FC<{ className?: string }>;
+  image: StaticImageData;
+  imageAlt?: string; // Optional image alt text
 }
 
 interface TimelineProps {
@@ -129,7 +136,16 @@ const TimelineItem: React.FC<{
           initial={{ opacity: 0, scale: 0.1 }}
           whileInView={{ opacity: 1, scale: 1, transition: { type: "spring", bounce: 0.4, duration: 1, delay: 0.5 } }}
         >
-          <IconComponent
+          <Image
+            src={milestone.image}
+            alt={milestone.imageAlt ?? milestone.title}
+            height={1080}
+            width={1080}
+            quality={100}
+            className="w-44 h-44 mx-auto"          
+          />
+
+          {/*<IconComponent
             className={`
               w-11 h-11 mx-auto
               ${
@@ -141,7 +157,7 @@ const TimelineItem: React.FC<{
               }
               transition-colors duration-300
             `}
-          />
+          />*/}
         </motion.div>
       </motion.div>
 
@@ -378,6 +394,8 @@ const sampleMilestones: TimelineMilestone[] = [
       "API based Spot Trading feature and Web3 Wallet integration",
     status: "completed",
     icon: GenesisBlockIcon,
+    image: arrowsModel,
+    imageAlt: "Arrows Model",
   },
   {
     id: "news",
@@ -388,6 +406,8 @@ const sampleMilestones: TimelineMilestone[] = [
       "AI automation engine for accurate industry News and Research across all markets.",
     status: "completed",
     icon: SmartContractIcon,
+    image: bracketsModel,
+    imageAlt: "Brackets Model",
   },
   {
     id: "predictions",
@@ -398,8 +418,10 @@ const sampleMilestones: TimelineMilestone[] = [
       "Layer-2 integration for Prediction markets powered by Polymarket",
     status: "active",
     icon: SmartContractIcon,
+    image: rocketModel,
+    imageAlt: "Rocket Model",
   },
-  {
+  /*   {
     id: "contracts",
     date: "Q4 2026",
     label: "Execution",
@@ -448,7 +470,7 @@ const sampleMilestones: TimelineMilestone[] = [
       "Multi-jurisdiction regulatory approval across APAC, EMEA, and Americas for institutional access.",
     status: "upcoming",
     icon: GlobalAdoptionIcon,
-  },
+  }, */
 ];
 
 export default function Timeline() {
