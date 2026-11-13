@@ -3,8 +3,10 @@
 import React, { useEffect, useRef, memo, useState } from 'react';
 import { LogoLoop, LogoItem } from './LogoLoop';
 import { TrendingUp, TrendingDown } from 'lucide-react';
+import { HermesClient } from '@pythnetwork/hermes-client';
 import { cn } from '@/lib/utils';
 import { PYTH_FEED_IDS, HERMES_SSE_URL } from '@/lib/token-constants';
+import { parseFeedToToken, type PythPriceUpdate } from '@/lib/token-price';
 
 interface TokenData {
   symbol: string;
@@ -132,12 +134,27 @@ const TokenCard = memo(function TokenCard({ token }: { token: TokenData }) {
   );
 });
 
+// Feed ids for the tokens in this ticker; computed once so it's a stable value.
+const feedIds = Object.values(PYTH_FEED_IDS);
+
+// Retry/fallback tuning for the Pyth SSE → REST fallback path.
+const MAX_SSE_ATTEMPTS = 3; // connect retries before falling back to polling our own /api/token-prices
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 20_000;
+const FALLBACK_POLL_INTERVAL_MS = 8000;
+const FALLBACK_POLL_TIMEOUT_MS = 90_000; // stop polling after ~90s of no SSE recovery (avoids an infinite loop)
+const SSE_INACTIVITY_FALLOVER_MS = 15_000; // fall back to REST polling if the feed is silent this long
+
 export function TokenTicker({ className, speed = 40 }: TokenTickerProps) {
   // SSE refs - must be at component level, not inside useEffect
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const baselinePricesRef = useRef<Record<string, number>>({});
+  const sseConnectedRef = useRef(false);
+  const errorCountRef = useRef(0);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const fallbackStopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Triple the tokens for seamless looping - more content = smoother transitions
   const tokens = useRef<TokenData[]>(
@@ -159,106 +176,126 @@ export function TokenTicker({ className, speed = 40 }: TokenTickerProps) {
     }))
   ).current;
 
-  // SSE Connection Logic
+  // SSE Connection Logic — live prices via Pyth, falling back to our own /api/token-prices when the feed is unreachable.
   useEffect(() => {
-    async function connectSSE() {
-      const feedIds = Object.values(PYTH_FEED_IDS);
+    let cancelled = false;
+
+    // Write a denominated price into the shared store (baseline + implied 24h change).
+    function applyPrice(symbol: string, price: number) {
+      if (!Number.isFinite(price)) return;
+      if (price <= 0) return; // ignore zero/negative raw values
+      if (!baselinePricesRef.current[symbol]) baselinePricesRef.current[symbol] = price;
+      const change24h = ((price - baselinePricesRef.current[symbol]) / baselinePricesRef.current[symbol]) * 100;
+      priceStore[symbol] = { price, change24h };
+    }
+
+    // Apply a parsed Pyth update (shared shape for both the SSE stream and REST response).
+    function applyUpdates(parsed: PythPriceUpdate[]): void {
+      for (const entry of parsed) {
+        if (!entry || !Number.isFinite(entry.price?.expo)) continue;
+        const normalizedId = String(entry.id).startsWith("0x") ? String(entry.id).slice(2) : String(entry.id);
+        const symbol = Object.keys(PYTH_FEED_IDS).find((key) => PYTH_FEED_IDS[key as keyof typeof PYTH_FEED_IDS] === normalizedId);
+        if (!symbol) continue; // not one of the tokens shown in this ticker
+
+        applyPrice(symbol, parseFeedToToken(symbol, entry)?.price ?? 0);
+      }
+    }
+
+    // Apply REST snapshot prices directly (they're already denominated).
+    function applyRestPrices(restPrices: Array<{ symbol: string; price: number }>): void {
+      restPrices.forEach((item) => applyPrice(item.symbol ?? "", item.price));
+    }
+
+    async function handleMessage(data: string): Promise<void> {
+      try {
+        const parsed = JSON.parse(data).parsed as PythPriceUpdate[] | undefined;
+        if (Array.isArray(parsed)) applyUpdates(parsed);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        console.warn("Error parsing SSE message:", msg);
+      }
+    }
+
+    async function connectSSE(): Promise<void> {
+      if (cancelled || sseConnectedRef.current) return;
 
       try {
-        // Use direct EventSource with Pyth SSE endpoint as per documentation
-        const idsParam = feedIds.map(id => `ids[]=0x${id}`).join('&');
-        const sseUrl = `${HERMES_SSE_URL}/v2/updates/price/stream?${idsParam}`;
-
-        const eventSource = new EventSource(sseUrl);
+        const client = new HermesClient(HERMES_SSE_URL, { httpRetries: 2 });
+        const eventSource = await client.getPriceUpdatesStream(feedIds);
         eventSourceRef.current = eventSource;
 
-        eventSource.onmessage = (event: MessageEvent) => {
-          try {
-            const data = JSON.parse(event.data);
-            const parsedPrices = data.parsed;
-            if (!parsedPrices) return;
+        errorCountRef.current = 0;
+        sseConnectedRef.current = true;
+        stopPolling();
 
-            const newPrices = parsedPrices.map((parsed: any) => {
-              const feedId = parsed.id.startsWith("0x") ? parsed.id.slice(2) : parsed.id;
-              const token = Object.keys(PYTH_FEED_IDS).find(
-                (key) => PYTH_FEED_IDS[key as keyof typeof PYTH_FEED_IDS] === feedId
-              );
-
-              if (!token) return null;
-
-              const price = Number(parsed.price.price) * Math.pow(10, parsed.price.expo);
-
-              return {
-                symbol: token,
-                price,
-              };
-            }).filter(Boolean);
-
-            if (newPrices.length > 0) {
-              // Update baseline prices on first update
-              newPrices.forEach((price: any) => {
-                if (!baselinePricesRef.current[price.symbol]) {
-                  baselinePricesRef.current[price.symbol] = price.price;
-                }
-              });
-
-              // Update global price store with calculated 24h change
-              newPrices.forEach((price: any) => {
-                const baseline = baselinePricesRef.current[price.symbol] || price.price;
-                const change24h = ((price.price - baseline) / baseline) * 100;
-                priceStore[price.symbol] = {
-                  price: price.price,
-                  change24h,
-                };
-              });
-
-              reconnectAttemptsRef.current = 0;
-            }
-          } catch (error) {
-            console.error("Error parsing SSE message:", error);
-          }
+        eventSource.onmessage = (event) => handleMessage(event.data);
+        // Native EventSource auto-reconnects on transient drops; only flag repeated failures.
+        eventSource.onerror = () => {
+          if (!sseConnectedRef.current) return; // not connected yet — the retry loop handles it
+          errorCountRef.current++;
+          console.warn(`Pyth SSE stream dropped (errors since connect: ${errorCountRef.current}); keeping native auto-reconnect.`);
         };
 
-        eventSource.onerror = (error: Event) => {
-          console.error("SSE connection error:", error);
-          eventSource.close();
-          reconnectWithBackoff();
-        };
+        // If the feed goes silent for a while, fall back to polling our own server.
+        if (SSE_INACTIVITY_FALLOVER_MS) {
+          reconnectTimeoutRef.current = setTimeout(() => {
+            sseConnectedRef.current = false;
+            stopPolling();
+            startPollingFallback();
+          }, SSE_INACTIVITY_FALLOVER_MS);
+        }
       } catch (error) {
-        console.error("Failed to create SSE connection:", error);
-        reconnectWithBackoff();
+        errorCountRef.current++;
+        const msg = error instanceof Error ? error.message : String(error);
+        console.warn("HermesClient failed to open SSE stream:", msg);
+        reconnectAttemptsRef.current++;
+        if (!cancelled && reconnectAttemptsRef.current < MAX_SSE_ATTEMPTS) scheduleReconnect();
+        else startPollingFallback();
       }
     }
 
-    function reconnectWithBackoff() {
-      const maxRetries = 5;
-      const initialDelay = 1000;
-      const maxDelay = 30000;
-
-      if (reconnectAttemptsRef.current >= maxRetries) {
-        console.log("Max reconnection attempts reached");
-        return;
-      }
-
-      const delay = Math.min(initialDelay * Math.pow(2, reconnectAttemptsRef.current), maxDelay);
-      reconnectAttemptsRef.current++;
-
-      console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current}/${maxRetries})`);
-
-      reconnectTimeoutRef.current = setTimeout(() => {
-        connectSSE();
-      }, delay);
+    function stopPolling(): void {
+      if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null; }
     }
 
-    function cleanup() {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
+    // REST fallback: poll our own /api/token-prices so prices still update when Pyth is unreachable.
+    function startPollingFallback(): void {
+      stopPolling();
+      console.info("Pyth feed unavailable via SSE — polling /api/token-prices as fallback.");
+      const tick = async (): Promise<void> => {
+        try {
+          const response = await fetch("/api/token-prices");
+          if (!response.ok) return; // upstream unreachable/auth-required — ignore and retry later
+          const data = await response.json();
+          if (!data || typeof data !== "object") return;
+          applyRestPrices((data as { prices?: Array<{ symbol: string; price: number }> }).prices ?? []);
+        } catch {
+          // transient network error while polling — keep trying on the next tick
+        }
+      };
+      pollIntervalRef.current = setInterval(tick, FALLBACK_POLL_INTERVAL_MS);
+
+      // Stop polling once SSE recovers or after a bounded window (avoids an infinite loop).
+      if (FALLBACK_POLL_TIMEOUT_MS) {
+        fallbackStopTimeoutRef.current = setTimeout(() => {
+          console.info("Fallback polling timed out; stopping until next mount.");
+          stopPolling();
+        }, FALLBACK_POLL_TIMEOUT_MS);
       }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
+    }
+
+    function scheduleReconnect(): void {
+      if (cancelled || sseConnectedRef.current) return;
+      const delay = Math.min(RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttemptsRef.current), RECONNECT_MAX_DELAY_MS);
+      reconnectTimeoutRef.current = setTimeout(() => { connectSSE(); }, delay);
+    }
+
+    function cleanup(): void {
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      stopPolling();
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      cancelled = true;
     }
 
     connectSSE();

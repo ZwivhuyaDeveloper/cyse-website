@@ -4,28 +4,16 @@ import { useEffect, useState, useRef } from "react";
 import Image from "next/image";
 import { HermesClient } from "@pythnetwork/hermes-client";
 import { PYTH_FEED_IDS, HERMES_SSE_URL } from "@/lib/token-constants";
+import {
+  type TokenPrice,
+  parseFeedToToken,
+  type PythPriceUpdate,
+} from "@/lib/token-price";
 
-interface TokenPrice {
-  symbol: string;
-  price: number;
-  change: number;
-  confidence: number;
-  publishTime: number;
-}
-
-// Types for Pyth SSE messages
-interface PythPriceData {
-  id: string;
-  price: {
-    price: string;      // raw price as string
-    conf: string;       // confidence as string
-    expo: number;       // exponent (negative)
-    publish_time: number;
-  };
-}
-
+// Types for Pyth SSE messages. These mirror the shared server types in
+// `lib/token-price.ts` so both endpoints agree on the wire format.
 interface PythMessage {
-  parsed?: PythPriceData[];
+  parsed?: PythPriceUpdate[];
 }
 
 const TOKEN_CONFIGS = [
@@ -100,7 +88,7 @@ export default function TokenDisplay() {
             if (!parsedPrices) return;
 
             const newPrices = parsedPrices
-              .map((parsed: PythPriceData): TokenPrice | null => {
+              .map((parsed): TokenPrice | null => {
                 const feedId = parsed.id.startsWith("0x") ? parsed.id.slice(2) : parsed.id;
                 const token = Object.keys(PYTH_FEED_IDS).find(
                   (key) => PYTH_FEED_IDS[key as keyof typeof PYTH_FEED_IDS] === feedId
@@ -108,16 +96,8 @@ export default function TokenDisplay() {
 
                 if (!token) return null;
 
-                const price = Number(parsed.price.price) * Math.pow(10, parsed.price.expo);
-                const confidence = Number(parsed.price.conf) * Math.pow(10, parsed.price.expo);
-
-                return {
-                  symbol: token,
-                  price,
-                  change: 0,
-                  confidence,
-                  publishTime: parsed.price.publish_time,
-                };
+                // Reuse the shared scaling logic so server and client agree exactly.
+                return parseFeedToToken(token, parsed);
               })
               .filter((item): item is TokenPrice => item !== null);
 
